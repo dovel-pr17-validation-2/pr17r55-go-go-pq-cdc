@@ -1,0 +1,495 @@
+package metric
+
+import (
+	"os"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+const (
+	cdcNamespace              = "go_pq_cdc"
+	replicationSlotSubsystem  = "replication_slot"
+	nanosecondsPerMillisecond = 1_000_000
+)
+
+type Metric interface {
+	InsertOpIncrement(count int64)
+	UpdateOpIncrement(count int64)
+	DeleteOpIncrement(count int64)
+	LogicalMessageIncrement(count int64)
+	SetCDCLatency(latency int64)
+	SetProcessLatency(latency int64)
+	SetSlotActivity(active bool)
+	SetSlotCurrentLSN(lsn float64)
+	SetSlotConfirmedFlushLSN(lsn float64)
+	SetSlotRetainedWALSize(lsn float64)
+	SetSlotLag(lsn float64)
+
+	SetSnapshotInProgress(inProgress bool)
+	SetSnapshotTotalTables(total int)
+	SetSnapshotCompletedTables(completed int)
+	SnapshotRowsIncrement(count int64)
+	SetSnapshotDurationSeconds(seconds float64)
+
+	// Distributed snapshot metrics
+	SetSnapshotTotalChunks(total int)
+	SetSnapshotCompletedChunks(completed int)
+	SetSnapshotActiveWorkers(workers int)
+
+	// Visibility guard metrics
+	ObserveVisibilityWait(d time.Duration)
+	VisibilityTimeoutIncrement()
+	VisibilityFailOpenIncrement()
+	SetVisibilityReplicaLag(replica string, lagBytes float64)
+	VisibilityReplicaCheck(replica string, cached bool)
+
+	PrometheusCollectors() []prometheus.Collector
+}
+
+type metric struct {
+	totalInsert prometheus.Counter
+	totalUpdate prometheus.Counter
+	totalDelete prometheus.Counter
+
+	totalLogicalMessage prometheus.Counter
+
+	cdcLatency                 prometheus.Gauge
+	cdcLatencyMilliseconds     prometheus.Gauge
+	processLatency             prometheus.Gauge
+	processLatencyMilliseconds prometheus.Gauge
+	slotActivity               prometheus.Gauge
+	slotConfirmedFlushLSN      prometheus.Gauge
+	slotCurrentLSN             prometheus.Gauge
+	slotRetainedWALSize        prometheus.Gauge
+	slotLag                    prometheus.Gauge
+
+	// Snapshot metrics
+	snapshotInProgress      prometheus.Gauge
+	snapshotTotalTables     prometheus.Gauge
+	snapshotCompletedTables prometheus.Gauge
+	snapshotTotalRows       prometheus.Counter
+	snapshotDurationSeconds prometheus.Gauge
+
+	// Distributed snapshot metrics
+	snapshotTotalChunks     prometheus.Gauge
+	snapshotCompletedChunks prometheus.Gauge
+	snapshotActiveWorkers   prometheus.Gauge
+
+	// Visibility guard metrics
+	visibilityWaitDuration    prometheus.Histogram
+	visibilityTimeoutTotal    prometheus.Counter
+	visibilityFailOpenTotal   prometheus.Counter
+	visibilityReplicaLagBytes *prometheus.GaugeVec
+	visibilityReplicaChecks   *prometheus.CounterVec
+}
+
+//nolint:funlen
+func NewMetric(slotName string) Metric {
+	hostname, _ := os.Hostname()
+	return &metric{
+		totalInsert: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "insert",
+			Name:      "total",
+			Help:      "total number of insert operation message in cdc",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		totalUpdate: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "update",
+			Name:      "total",
+			Help:      "total number of update operation message in cdc",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		totalDelete: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "delete",
+			Name:      "total",
+			Help:      "total number of delete operation message in cdc",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		totalLogicalMessage: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "logical_message",
+			Name:      "total",
+			Help:      "total number of logical decoding messages in cdc",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		cdcLatency: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "cdc_latency",
+			Name:      "current",
+			Help:      "latest consumed cdc message latency in nanoseconds",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		cdcLatencyMilliseconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "cdc_latency",
+			Name:      "current_milliseconds",
+			Help:      "latest consumed cdc message latency in milliseconds",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		processLatency: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "process_latency",
+			Name:      "current",
+			Help:      "latest cdc process latency in nanoseconds",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		processLatencyMilliseconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "process_latency",
+			Name:      "current_milliseconds",
+			Help:      "latest cdc process latency in milliseconds",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		slotActivity: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: replicationSlotSubsystem,
+			Name:      "slot_is_active",
+			Help:      "whether the replication slot is active or not",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		slotConfirmedFlushLSN: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: replicationSlotSubsystem,
+			Name:      "slot_confirmed_flush_lsn",
+			Help:      "last lsn confirmed flushed to the replication slot",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		slotCurrentLSN: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: replicationSlotSubsystem,
+			Name:      "slot_current_lsn",
+			Help:      "current lsn",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		slotRetainedWALSize: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: replicationSlotSubsystem,
+			Name:      "slot_retained_wal_size",
+			Help:      "current lsn - restart lsn",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		slotLag: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: replicationSlotSubsystem,
+			Name:      "slot_lag",
+			Help:      "current lsn - confirmed flush lsn",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		snapshotInProgress: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "snapshot",
+			Name:      "in_progress",
+			Help:      "indicates if snapshot is currently in progress (1) or not (0)",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		snapshotTotalTables: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "snapshot",
+			Name:      "total_tables",
+			Help:      "total number of tables to snapshot",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		snapshotCompletedTables: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "snapshot",
+			Name:      "completed_tables",
+			Help:      "number of tables completed in snapshot",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		snapshotTotalRows: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "snapshot",
+			Name:      "total_rows",
+			Help:      "total number of rows read during snapshot",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		snapshotDurationSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "snapshot",
+			Name:      "duration_seconds",
+			Help:      "duration of the last snapshot operation in seconds",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		snapshotTotalChunks: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "snapshot",
+			Name:      "total_chunks",
+			Help:      "total number of chunks in distributed snapshot",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		snapshotCompletedChunks: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "snapshot",
+			Name:      "completed_chunks",
+			Help:      "number of chunks completed in distributed snapshot",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		snapshotActiveWorkers: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "snapshot",
+			Name:      "active_workers",
+			Help:      "number of active worker instances processing distributed snapshot",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		visibilityWaitDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "visibility",
+			Name:      "wait_duration_seconds",
+			Help:      "time the visibility guard held a transaction until it became visible on the primary",
+			Buckets:   prometheus.ExponentialBuckets(0.001, 2, 15),
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		visibilityTimeoutTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "visibility",
+			Name:      "timeout_total",
+			Help:      "number of visibility guard waits that reached visibilityGuard.timeout",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		visibilityFailOpenTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "visibility",
+			Name:      "fail_open_total",
+			Help:      "number of messages dispatched after a visibility guard timeout (failMode: open)",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}),
+		visibilityReplicaLagBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "visibility",
+			Name:      "replica_lag_bytes",
+			Help:      "WAL bytes a listed standby still has to replay before the transaction held by the visibility guard is applied (0 once applied)",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}, []string{"replica"}),
+		visibilityReplicaChecks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: cdcNamespace,
+			Subsystem: "visibility",
+			Name:      "replica_checks_total",
+			Help:      "transactions certified per listed standby, by source: cached (a recent poll already passed the commit) or polled",
+			ConstLabels: prometheus.Labels{
+				"slot_name": slotName,
+				"host":      hostname,
+			},
+		}, []string{"replica", "result"}),
+	}
+}
+
+func (m *metric) PrometheusCollectors() []prometheus.Collector {
+	return []prometheus.Collector{
+		m.totalInsert,
+		m.totalUpdate,
+		m.totalDelete,
+		m.totalLogicalMessage,
+		m.cdcLatency,
+		m.cdcLatencyMilliseconds,
+		m.processLatency,
+		m.processLatencyMilliseconds,
+		m.slotActivity,
+		m.slotCurrentLSN,
+		m.slotConfirmedFlushLSN,
+		m.slotRetainedWALSize,
+		m.slotLag,
+		m.snapshotInProgress,
+		m.snapshotTotalTables,
+		m.snapshotCompletedTables,
+		m.snapshotTotalRows,
+		m.snapshotDurationSeconds,
+		m.snapshotTotalChunks,
+		m.snapshotCompletedChunks,
+		m.snapshotActiveWorkers,
+		m.visibilityWaitDuration,
+		m.visibilityTimeoutTotal,
+		m.visibilityFailOpenTotal,
+		m.visibilityReplicaLagBytes,
+		m.visibilityReplicaChecks,
+	}
+}
+
+func (m *metric) InsertOpIncrement(count int64) {
+	m.totalInsert.Add(float64(count))
+}
+
+func (m *metric) UpdateOpIncrement(count int64) {
+	m.totalUpdate.Add(float64(count))
+}
+
+func (m *metric) DeleteOpIncrement(count int64) {
+	m.totalDelete.Add(float64(count))
+}
+
+func (m *metric) LogicalMessageIncrement(count int64) {
+	m.totalLogicalMessage.Add(float64(count))
+}
+
+func (m *metric) SetCDCLatency(latency int64) {
+	m.cdcLatency.Set(float64(latency))
+	m.cdcLatencyMilliseconds.Set(float64(latency) / nanosecondsPerMillisecond)
+}
+
+func (m *metric) SetProcessLatency(latency int64) {
+	m.processLatency.Set(float64(latency))
+	m.processLatencyMilliseconds.Set(float64(latency) / nanosecondsPerMillisecond)
+}
+
+func (m *metric) SetSlotActivity(active bool) {
+	slotActivity := 0.0
+	if active {
+		slotActivity = 1.0
+	}
+
+	m.slotActivity.Set(slotActivity)
+}
+
+func (m *metric) SetSlotCurrentLSN(lsn float64) {
+	m.slotCurrentLSN.Set(float64(lsn))
+}
+
+func (m *metric) SetSlotConfirmedFlushLSN(lsn float64) {
+	m.slotConfirmedFlushLSN.Set(float64(lsn))
+}
+
+func (m *metric) SetSlotRetainedWALSize(lsn float64) {
+	m.slotRetainedWALSize.Set(float64(lsn))
+}
+
+func (m *metric) SetSlotLag(lsn float64) {
+	m.slotLag.Set(float64(lsn))
+}
+
+func (m *metric) SetSnapshotInProgress(inProgress bool) {
+	value := 0.0
+	if inProgress {
+		value = 1.0
+	}
+	m.snapshotInProgress.Set(value)
+}
+
+func (m *metric) SetSnapshotTotalTables(total int) {
+	m.snapshotTotalTables.Set(float64(total))
+}
+
+func (m *metric) SetSnapshotCompletedTables(completed int) {
+	m.snapshotCompletedTables.Set(float64(completed))
+}
+
+func (m *metric) SnapshotRowsIncrement(count int64) {
+	m.snapshotTotalRows.Add(float64(count))
+}
+
+func (m *metric) SetSnapshotDurationSeconds(seconds float64) {
+	m.snapshotDurationSeconds.Set(seconds)
+}
+
+func (m *metric) SetSnapshotTotalChunks(total int) {
+	m.snapshotTotalChunks.Set(float64(total))
+}
+
+func (m *metric) SetSnapshotCompletedChunks(completed int) {
+	m.snapshotCompletedChunks.Set(float64(completed))
+}
+
+func (m *metric) SetSnapshotActiveWorkers(workers int) {
+	m.snapshotActiveWorkers.Set(float64(workers))
+}
+
+func (m *metric) ObserveVisibilityWait(d time.Duration) {
+	m.visibilityWaitDuration.Observe(d.Seconds())
+}
+
+func (m *metric) VisibilityTimeoutIncrement() {
+	m.visibilityTimeoutTotal.Inc()
+}
+
+func (m *metric) VisibilityFailOpenIncrement() {
+	m.visibilityFailOpenTotal.Inc()
+}
+
+func (m *metric) SetVisibilityReplicaLag(replica string, lagBytes float64) {
+	m.visibilityReplicaLagBytes.WithLabelValues(replica).Set(lagBytes)
+}
+
+func (m *metric) VisibilityReplicaCheck(replica string, cached bool) {
+	result := "polled"
+	if cached {
+		result = "cached"
+	}
+	m.visibilityReplicaChecks.WithLabelValues(replica, result).Inc()
+}

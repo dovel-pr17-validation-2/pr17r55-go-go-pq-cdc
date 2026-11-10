@@ -1,0 +1,1278 @@
+package replication
+
+import (
+	"context"
+	"encoding/binary"
+	goerrors "errors"
+	"fmt"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/Trendyol/go-pq-cdc/config"
+	"github.com/Trendyol/go-pq-cdc/internal/metric"
+	"github.com/Trendyol/go-pq-cdc/logger"
+	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/Trendyol/go-pq-cdc/pq/message"
+	"github.com/Trendyol/go-pq-cdc/pq/message/format"
+	"github.com/avast/retry-go/v4"
+	"github.com/go-playground/errors"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
+)
+
+var (
+	ErrorSlotInUse    = errors.New("replication slot in use")
+	ErrorNotConnected = errors.New("stream is not connected")
+)
+
+const (
+	StandbyStatusUpdateByteID = 'r'
+	streamShutdownTimeout     = 30 * time.Second
+	// standbyStatusWriteTimeout bounds a single 34-byte status write. A peer
+	// that stops reading must not pin connMu (and with it Close) past the
+	// shutdown budget.
+	standbyStatusWriteTimeout = 5 * time.Second
+	postgresAdminShutdown     = "57P01"
+	postgresCrashShutdown     = "57P02"
+)
+
+type ListenerContext struct {
+	Context context.Context
+	Message any
+	Ack     func() error
+	// Xid is the top-level transaction that produced Message (Begin.Xid, or
+	// StreamStart.Xid for a streamed transaction). Zero when the message is
+	// not part of a transaction, including snapshot events.
+	Xid uint32
+	// CommitLSN is the start of the commit record of the transaction that
+	// produced Message (pgoutput Begin.FinalLSN, StreamCommit.CommitLSN for
+	// streamed transactions). Zero for snapshot events.
+	//
+	// A standby has applied that transaction only once
+	// pg_last_wal_replay_lsn() > CommitLSN. The comparison is strict:
+	// pg_last_wal_replay_lsn() reports the end of the last replayed record, so
+	// it equals CommitLSN right before the commit record itself is applied.
+	CommitLSN pq.LSN
+}
+
+type ListenerFunc func(ctx *ListenerContext)
+
+type Message struct {
+	message  any
+	walStart int64
+	// xid is the top-level transaction the message belongs to (Begin.Xid or
+	// StreamStart.Xid); the visibility guard gates on it.
+	xid uint32
+	// commitLSN is the start of the transaction's commit record, exposed as
+	// ListenerContext.CommitLSN.
+	commitLSN pq.LSN
+}
+
+// transactionScoped reports whether the message belongs to a transaction whose
+// visibility and replication the gate must certify before delivery.
+//
+// A non-transactional logical decoding message does not belong to one:
+// dispatchMessage delivers it with xid 0 and commitLSN 0 because
+// pg_logical_emit_message was called outside a transaction, and gate() rejects
+// that pair as "decoded without its BEGIN". The check is type-based rather than
+// field-based on purpose — a DML message that arrives with a zero xid is exactly
+// the case gate() must reject, so it stays transaction-scoped.
+func (m *Message) transactionScoped() bool {
+	logical, ok := m.message.(*format.LogicalDecodingMessage)
+	return !ok || logical.Flags&1 != 0
+}
+
+type Streamer interface {
+	Connect(ctx context.Context) error
+	Open(ctx context.Context) error
+	Close(ctx context.Context) error
+	GetSystemInfo() *pq.IdentifySystemResult
+	GetMetric() metric.Metric
+	OpenFromSnapshotLSN()
+}
+
+type stream struct {
+	metric              metric.Metric
+	conn                pq.Connection
+	guard               *visibilityGuard
+	replicas            *replicaGuard
+	cancel              context.CancelFunc
+	system              *pq.IdentifySystemResult
+	relation            map[uint32]*format.Relation
+	messageCH           chan *Message
+	listenerFunc        ListenerFunc
+	sinkEnd             chan struct{}
+	processEnd          chan struct{}
+	statusUpdateEnd     chan struct{}
+	mu                  *sync.RWMutex
+	config              config.Config
+	lastXLogPos         pq.LSN
+	snapshotLSN         pq.LSN
+	confirmedXLogPos    pq.LSN
+	acked               atomic.Uint64 // messages acked at least once; in flight = messageBuffer.sent - acked
+	messageCloseOnce    sync.Once
+	connMu              sync.Mutex
+	closed              atomic.Bool
+	sinkStarted         atomic.Bool
+	processStarted      atomic.Bool
+	statusUpdateStarted atomic.Bool
+	statusUpdateFailed  atomic.Bool
+	openFromSnapshotLSN bool
+}
+
+func NewStream(dsn string, cfg config.Config, m metric.Metric, listenerFunc ListenerFunc) Streamer {
+	return &stream{
+		conn:         pq.NewConnectionTemplate(dsn),
+		metric:       m,
+		config:       cfg,
+		relation:     make(map[uint32]*format.Relation),
+		messageCH:    make(chan *Message, 1000),
+		listenerFunc: listenerFunc,
+		// lastXLogPos:0 is not magical, 0 means, create replication starts with confirmed_flush_lsn
+		// https://github.com/postgres/postgres/blob/master/src/include/access/xlogdefs.h#L28
+		// https://github.com/postgres/postgres/blob/master/src/backend/replication/logical/logical.c#L540
+		lastXLogPos: 0,
+		sinkEnd:     make(chan struct{}, 1),
+		processEnd:  make(chan struct{}, 1),
+
+		statusUpdateEnd: make(chan struct{}),
+		mu:              &sync.RWMutex{},
+	}
+}
+
+func (s *stream) Connect(ctx context.Context) error {
+	if err := s.conn.Connect(ctx); err != nil {
+		return errors.Wrap(err, "stream connection")
+	}
+
+	system, err := pq.IdentifySystem(ctx, s.conn)
+	if err != nil {
+		_ = s.conn.Close(ctx)
+		return errors.Wrap(err, "identify system")
+	}
+
+	s.system = &system
+	logger.Info("system identification", "systemID", system.SystemID, "timeline", system.Timeline, "xLogPos", system.LoadXLogPos(), "database:", system.Database)
+	return nil
+}
+
+func (s *stream) Open(ctx context.Context) error {
+	if s.conn.IsClosed() {
+		return ErrorNotConnected
+	}
+
+	if err := s.setup(ctx); err != nil {
+		var v *pgconn.PgError
+		if goerrors.As(err, &v) && v.Code == "55006" {
+			return ErrorSlotInUse
+		}
+		return errors.Wrap(err, "replication setup")
+	}
+
+	// Opened after setup so the ErrorSlotInUse retry loop never churns guard
+	// connections; bound to this replication session (same host, same timeline).
+	if s.config.VisibilityGuard.Enabled {
+		guard, err := openVisibilityGuard(ctx, s.config.DSN(), s.config.VisibilityGuard, s.system.Timeline, s.metric)
+		if err != nil {
+			return errors.Wrap(err, "visibility guard")
+		}
+		s.guard = guard
+		logger.Info("visibility guard enabled",
+			"failMode", s.config.VisibilityGuard.FailMode,
+			"timeout", s.config.VisibilityGuard.Timeout,
+			"pollInterval", s.config.VisibilityGuard.PollInterval,
+		)
+		// Standbys share the guard's budget and failMode; they need the primary
+		// guard because P5 (sync rep + fail-closed) is what closes the timeline
+		// race the replica poll cannot see. See docs/replica-guard-design.md.
+		if len(s.config.VisibilityGuard.Replicas) > 0 {
+			replicas, err := openReplicaGuard(ctx, s.config, s.system, s.metric)
+			if err != nil {
+				_ = s.guard.close(ctx)
+				s.guard = nil
+				return errors.Wrap(err, "replica guard")
+			}
+			s.replicas = replicas
+			logger.Info("replica guard enabled", "replicas", s.config.VisibilityGuard.Replicas)
+		}
+	}
+
+	s.sinkStarted.Store(true)
+	s.processStarted.Store(true)
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cancel = cancel
+
+	go s.sink(runCtx)
+	go s.process(runCtx)
+
+	// Postgres asks for a reply about every wal_sender_timeout/2 while it is
+	// still streaming, but the request travels behind the WAL already sent and
+	// only counts once the sink reads and answers it. A backlog that keeps the
+	// socket from draining can miss the deadline, so acknowledge on our own
+	// cadence instead of waiting for a read.
+	if s.config.StatusUpdateEvery() > 0 {
+		s.startStatusUpdateLoop(runCtx)
+	}
+
+	logger.Info("cdc stream started")
+
+	return nil
+}
+
+func (s *stream) setup(ctx context.Context) error {
+	replication := New(s.conn)
+
+	replicationStartLsn := s.lastXLogPos
+	if s.openFromSnapshotLSN {
+		snapshotLSN, err := s.fetchSnapshotLSN(ctx)
+		if err != nil {
+			return errors.Wrap(err, "fetch snapshot LSN")
+		}
+		replicationStartLsn = snapshotLSN
+	}
+
+	if err := replication.StartWithOptions(s.config.Publication.Name, s.config.Slot.Name, replicationStartLsn, StartOptions{
+		ProtoVersion:    s.config.Slot.ProtoVersion,
+		LogicalMessages: s.config.Slot.LogicalMessages,
+	}); err != nil {
+		return err
+	}
+
+	if err := replication.Test(ctx); err != nil {
+		return err
+	}
+
+	if s.openFromSnapshotLSN {
+		logger.Info("replication started from snapshot LSN", "slot", s.config.Slot.Name, "lsn", replicationStartLsn.String())
+	} else {
+		logger.Info("replication started from confirmed_flush_lsn", "slot", s.config.Slot.Name)
+	}
+
+	return nil
+}
+
+// messageBuffer manages a one-message look-ahead buffer.
+//
+// The last DML message in each transaction is held back so its WAL position
+// can be rewritten to the transaction-end LSN (from COMMIT / STREAM COMMIT).
+// All preceding messages are emitted immediately with their original position.
+// This keeps memory usage O(1) regardless of transaction size.
+type messageBuffer struct {
+	pending   *Message
+	outCh     chan<- *Message
+	ctx       context.Context
+	sent      uint64 // messages handed to outCh; the sink goroutine owns it
+	xid       uint32 // current transaction, from Begin
+	inTx      bool   // between Begin and Commit; Begin itself is never delivered
+	commitLSN pq.LSN // current transaction's commit record, from Begin.FinalLSN
+}
+
+func (b *messageBuffer) send(msg *Message) bool {
+	ctx := b.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case b.outCh <- msg:
+		b.sent++
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// flush emits the pending message (if any) with its original WAL position.
+func (b *messageBuffer) flush() {
+	if b.pending != nil {
+		if b.send(b.pending) {
+			b.pending = nil
+		}
+	}
+}
+
+// flushWithLSN emits the pending message (if any), rewriting its WAL position
+// to the given transaction-end LSN. Used at COMMIT.
+func (b *messageBuffer) flushWithLSN(lsn pq.LSN) {
+	if b.pending != nil {
+		if !b.send(&Message{
+			message:   b.pending.message,
+			walStart:  int64(lsn),
+			xid:       b.pending.xid,
+			commitLSN: b.pending.commitLSN,
+		}) {
+			return
+		}
+		b.pending = nil
+	}
+}
+
+// discard drops the pending message without emitting.
+// Used at BEGIN to reset state.
+func (b *messageBuffer) discard() {
+	b.pending = nil
+}
+
+// buffer stores a new DML message, first flushing any previously pending one.
+func (b *messageBuffer) buffer(msg *Message) {
+	b.flush()
+	b.pending = msg
+}
+
+// streamTxBuffer accumulates messages from streaming in-progress transactions.
+//
+// PostgreSQL streams large transactions in chunks (STREAM START / STREAM STOP)
+// before the transaction is committed. Chunks from different transactions may
+// be interleaved (e.g. TX-A chunk, TX-B chunk, TX-A chunk, …), so messages
+// are stored per-XID in a map.
+//
+// Messages must NOT be delivered to the consumer until STREAM COMMIT arrives,
+// because the transaction may still be rolled back (STREAM ABORT). This mirrors
+// how PostgreSQL's own logical replication worker handles streaming: it writes
+// to temporary storage and only applies on commit.
+type streamTxBuffer struct {
+	txns map[uint32][]*Message
+	// subXacts records, per top-level XID, every sub-transaction XID in the
+	// order it first appeared together with the txns index of its first
+	// message. STREAM ABORT for a sub-transaction truncates txns at that
+	// index, mirroring PostgreSQL's worker.c stream_abort_internal.
+	subXacts  map[uint32][]subXact
+	activeXid uint32
+	streaming bool
+}
+
+type subXact struct {
+	xid   uint32
+	index int
+}
+
+// startTx marks the beginning of a streaming chunk for the given XID. The XID
+// stays in txns until STREAM COMMIT or ABORT, rows or not, so the transaction
+// counts as open between its chunks.
+func (s *streamTxBuffer) startTx(xid uint32) {
+	if s.txns == nil {
+		s.txns = make(map[uint32][]*Message)
+		s.subXacts = make(map[uint32][]subXact)
+	}
+	if _, ok := s.txns[xid]; !ok {
+		s.txns[xid] = nil
+	}
+	s.activeXid = xid
+	s.streaming = true
+}
+
+// append adds a message to the currently active streaming transaction.
+// xid is the (sub)transaction the message was decoded with; a value other
+// than the active top-level XID marks a sub-transaction.
+func (s *streamTxBuffer) append(msg *Message, xid uint32) {
+	if msg == nil {
+		return
+	}
+	if xid != s.activeXid && !s.hasSubXact(xid) {
+		s.subXacts[s.activeXid] = append(s.subXacts[s.activeXid], subXact{xid: xid, index: len(s.txns[s.activeXid])})
+	}
+	s.txns[s.activeXid] = append(s.txns[s.activeXid], msg)
+}
+
+func (s *streamTxBuffer) hasSubXact(xid uint32) bool {
+	subs := s.subXacts[s.activeXid]
+	// Scan from the tail: a message almost always belongs to the most recent sub-transaction.
+	for i := len(subs) - 1; i >= 0; i-- {
+		if subs[i].xid == xid {
+			return true
+		}
+	}
+	return false
+}
+
+// stopTx marks the end of the current streaming chunk.
+func (s *streamTxBuffer) stopTx() {
+	s.streaming = false
+}
+
+// flushTx emits every accumulated message for the given XID through send.
+// Every message is stamped with the commit LSN (known only at STREAM COMMIT);
+// the last message's WAL position is rewritten to the transaction-end LSN.
+func (s *streamTxBuffer) flushTx(xid uint32, send func(*Message) bool, commitLSN, endLSN pq.LSN) {
+	s.streaming = false
+	msgs := s.txns[xid]
+	n := len(msgs)
+	for i, msg := range msgs {
+		msg.commitLSN = commitLSN
+		out := msg
+		if i == n-1 {
+			out = &Message{
+				message:   msg.message,
+				walStart:  int64(endLSN),
+				xid:       msg.xid,
+				commitLSN: commitLSN,
+			}
+		}
+		if !send(out) {
+			return
+		}
+	}
+	delete(s.txns, xid)
+	delete(s.subXacts, xid)
+}
+
+// abortTx handles STREAM ABORT. subXid == xid rolls back the whole
+// transaction. Otherwise only the sub-transaction is rolled back: every
+// message from its first appearance onwards is dropped (later sub-transactions
+// are nested in or follow it, so they are gone too); messages before it stay.
+func (s *streamTxBuffer) abortTx(xid, subXid uint32) {
+	s.streaming = false
+	if subXid == xid {
+		delete(s.txns, xid)
+		delete(s.subXacts, xid)
+		return
+	}
+	subs := s.subXacts[xid]
+	for i := len(subs) - 1; i >= 0; i-- {
+		if subs[i].xid == subXid {
+			s.txns[xid] = s.txns[xid][:subs[i].index]
+			s.subXacts[xid] = subs[:i]
+			return
+		}
+	}
+	// Unknown sub-transaction: none of its changes reached us, nothing to drop.
+}
+
+func (s *stream) sink(ctx context.Context) {
+	logger.Info("postgres message sink started")
+
+	buf := &messageBuffer{outCh: s.messageCH}
+	buf.ctx = ctx
+	streamBuf := &streamTxBuffer{}
+	corrupted := s.sinkLoop(ctx, buf, streamBuf)
+	s.messageCloseOnce.Do(func() {
+		close(s.messageCH)
+	})
+
+	s.sinkEnd <- struct{}{}
+	if !s.closed.Load() {
+		// The reader can also initiate shutdown after an unexpected disconnect.
+		// Do not let a synchronous application listener turn that path into an
+		// unbounded wait when the stream context has no deadline.
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), streamShutdownTimeout)
+		defer cancel()
+		if err := s.Close(closeCtx); err != nil {
+			logger.Error("replication stream shutdown failed", "error", err)
+		}
+		if corrupted {
+			panic("corrupted connection")
+		}
+	}
+}
+
+// sinkLoop reads raw replication messages and dispatches them until the
+// connection is closed or a fatal error occurs. It returns true when the
+// connection is in a corrupted state and the caller should panic.
+func (s *stream) sinkLoop(ctx context.Context, buf *messageBuffer, streamBuf *streamTxBuffer) (corrupted bool) {
+	for {
+		// A failed periodic status write cancels the stream, but the read below
+		// deliberately ignores ctx. Without this check the sink would keep
+		// reading and discard every event against a dead protocol position.
+		if s.statusUpdateFailed.Load() {
+			return true
+		}
+		msgCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), time.Now().Add(300*time.Millisecond))
+		// Hold connMu only for the read itself. ReceiveMessage's deferred Unwatch
+		// (which clears the socket deadline) has run by the time it returns, so the
+		// deadline-toggle window is fully contained here; releasing before the
+		// channel sends in handleXLogData keeps acks from blocking the sink and
+		// vice versa.
+		s.connMu.Lock()
+		rawMsg, err := s.conn.ReceiveMessage(msgCtx)
+		s.connMu.Unlock()
+		cancel()
+
+		if err != nil {
+			if s.closed.Load() {
+				logger.Info("stream stopped")
+				return false
+			}
+			if handleReplicationConnectionTermination(err) {
+				// Connection is gone while we are still running. Close and panic
+				// so the process restarts with a fresh replication connection.
+				return true
+			}
+			if pgconn.Timeout(err) {
+				if s.LoadXLogPos() > 0 {
+					if err = s.sendRunStandbyStatusUpdate(ctx); err != nil {
+						if !handleReplicationConnectionTermination(err) {
+							logger.Error("send stand by status update", "error", err)
+						}
+						return true
+					}
+					logger.Debug("send stand by status update")
+				}
+				continue
+			}
+			logger.Error("receive message error", "error", err)
+			return true
+		}
+
+		copyData, ok := s.extractCopyData(rawMsg)
+		if !ok {
+			continue
+		}
+
+		switch copyData.Data[0] {
+		case message.PrimaryKeepaliveMessageByteID:
+			if err := s.handleKeepalive(ctx, copyData.Data[1:], buf, streamBuf); err != nil {
+				handleReplicationConnectionTermination(err)
+				return true
+			}
+		case message.XLogDataByteID:
+			s.handleXLogData(copyData.Data[1:], buf, streamBuf)
+		}
+	}
+}
+
+// extractCopyData validates a raw backend message. It returns the CopyData
+// payload and true on success, or (nil, false) for protocol-level errors and
+// unexpected message types which are logged and skipped.
+func (s *stream) extractCopyData(rawMsg pgproto3.BackendMessage) (*pgproto3.CopyData, bool) {
+	if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
+		res, _ := errMsg.MarshalJSON()
+		logger.Error("receive postgres wal error: " + string(res))
+		return nil, false
+	}
+
+	msg, ok := rawMsg.(*pgproto3.CopyData)
+	if !ok {
+		logger.Warn(fmt.Sprintf("received unexpected message: %T", rawMsg))
+		return nil, false
+	}
+
+	return msg, true
+}
+
+// handleKeepalive processes a primary keepalive message, updating the WAL
+// position and responding with a standby status update when requested.
+// A non-nil return signals a corrupted connection.
+func (s *stream) handleKeepalive(ctx context.Context, data []byte, buf *messageBuffer, streamBuf *streamTxBuffer) error {
+	pkm, err := format.NewPrimaryKeepaliveMessage(data)
+	if err != nil {
+		logger.Error("decode primary keepalive message", "error", err)
+		return nil // non-fatal, skip
+	}
+
+	if pkm.ServerWALEnd > 0 {
+		s.UpdateXLogPos(pkm.ServerWALEnd)
+		logger.Debug("updated xlog position from keepalive", "serverWALEnd", pkm.ServerWALEnd.String())
+
+		// The walsender decodes in WAL order: every transaction that committed
+		// below ServerWALEnd has already been sent. Confirm it, as PostgreSQL's
+		// apply worker does, only when none of that is still held here: no open
+		// regular or streamed transaction, an empty look-ahead, and every
+		// message sent to messageCH acked (counted at the send, so queued ones
+		// count too). Only this goroutine sends, so the check cannot go stale.
+		// ctx is the context the buffers send on: once it is cancelled a send
+		// can fail and lose its message without a trace, so stop confirming.
+		if ctx.Err() == nil && !buf.inTx && buf.pending == nil &&
+			len(streamBuf.txns) == 0 && buf.sent == s.acked.Load() {
+			s.UpdateConfirmedXLogPos(pkm.ServerWALEnd)
+		}
+	}
+
+	if pkm.ReplyRequested {
+		if err = s.sendRunStandbyStatusUpdate(ctx); err != nil {
+			logger.Error("standby status update", "error", err)
+			return err
+		}
+		logger.Debug("standby status update sent on keepalive request")
+	}
+
+	return nil
+}
+
+// handleXLogData parses a WAL data message, decodes the logical replication
+// event, and dispatches it through the message buffer.
+func (s *stream) handleXLogData(data []byte, buf *messageBuffer, streamBuf *streamTxBuffer) {
+	xld, err := ParseXLogData(data)
+	if err != nil {
+		logger.Error("parse xLog data", "error", err)
+		return
+	}
+
+	logger.Debug("wal received",
+		"walDataLen", len(xld.WALData),
+		"walStart", xld.WALStart,
+		"walEnd", xld.ServerWALEnd,
+		"serverTime", xld.ServerTime,
+	)
+
+	s.UpdateXLogPos(xld.ServerWALEnd)
+	s.metric.SetCDCLatency(time.Now().UTC().Sub(xld.ServerTime).Nanoseconds())
+
+	decodedMsg, err := message.New(xld.WALData, streamBuf.streaming, xld.ServerTime, s.relation)
+	if err != nil {
+		logger.Warn("wal data message parsing error, message dropped", "error", err, "walStart", xld.WALStart)
+		return
+	}
+	if decodedMsg == nil {
+		return
+	}
+
+	// add LSN to insert/update/delete messages.
+	switch m := decodedMsg.(type) {
+	case *format.Insert:
+		m.LSN = xld.WALStart
+	case *format.Update:
+		m.LSN = xld.WALStart
+	case *format.Delete:
+		m.LSN = xld.WALStart
+	}
+
+	s.dispatchMessage(decodedMsg, xld, buf, streamBuf)
+}
+
+// dispatchMessage routes a decoded logical replication event to the correct
+// buffer action.
+//
+// For regular (non-streaming) transactions the messageBuffer provides a
+// one-message look-ahead so the last DML's WAL position can be rewritten to
+// the transaction-end LSN at COMMIT.
+//
+// For streaming transactions (proto v2) messages are accumulated in the
+// streamTxBuffer across STREAM START / STREAM STOP chunks. They are only
+// emitted to the consumer on STREAM COMMIT and discarded on STREAM ABORT
+// (whole transaction or, for a sub-transaction abort, only its own changes).
+// This prevents uncommitted data from being delivered.
+func (s *stream) dispatchMessage(decodedMsg any, xld XLogData, buf *messageBuffer, streamBuf *streamTxBuffer) {
+	// A non-transactional logical decoding message belongs to no transaction.
+	// Deliver it straight to the consumer instead of the one-message
+	// look-ahead, which would only release it on the next record and drop it
+	// outright when a BEGIN follows. xid and commitLSN stay zero so the
+	// consumer does not inherit the identity of a transaction this message is
+	// not part of; processLoop skips the visibility gate for those.
+	if m, ok := decodedMsg.(*format.LogicalDecodingMessage); ok && m.Flags&1 == 0 && !streamBuf.streaming {
+		// Deliver now, but confirm nothing while a streamed transaction still
+		// holds rows at positions below this record: a confirmation promises the
+		// server that everything below it has been handled, and those rows exist
+		// only in this process. 0 is a no-op for the confirmed position, which
+		// only moves forward; the transaction's end-of-transaction ack, or the
+		// next idle keepalive if it ends without one, covers this message.
+		walStart := int64(0)
+		if len(streamBuf.txns) == 0 {
+			walStart = int64(xld.WALStart)
+		}
+		buf.send(&Message{message: m, walStart: walStart})
+		return
+	}
+
+	switch msg := decodedMsg.(type) {
+	case *format.Begin:
+		buf.discard()
+		buf.xid = msg.Xid
+		buf.commitLSN = msg.FinalLSN
+		buf.inTx = true
+
+	case *format.Commit:
+		buf.flushWithLSN(msg.TransactionEndLSN)
+		buf.inTx = false
+
+	case *format.StreamStart:
+		// Beginning of a streaming chunk – DML events that follow belong
+		// to an in-progress transaction and must be buffered per-XID.
+		streamBuf.startTx(msg.Xid)
+
+	case *format.StreamStop:
+		// End of a streaming chunk. Nothing is emitted to the consumer.
+		streamBuf.stopTx()
+
+	case *format.StreamCommit:
+		// Final commit of a streamed transaction – emit all messages for this XID.
+		streamBuf.flushTx(msg.Xid, buf.send, msg.CommitLSN, msg.TransactionEndLSN)
+
+	case *format.StreamAbort:
+		// Whole transaction (SubXid == Xid) or a single sub-transaction
+		// (ROLLBACK TO SAVEPOINT, plpgsql EXCEPTION block) rolled back.
+		streamBuf.abortTx(msg.Xid, msg.SubXid)
+
+	default:
+		// DML event (Insert, Update, Delete, Relation, …)
+		m := &Message{
+			message:  decodedMsg,
+			walStart: int64(xld.WALStart),
+		}
+		if streamBuf.streaming {
+			m.xid = streamBuf.activeXid
+			streamBuf.append(m, messageXid(decodedMsg))
+		} else {
+			m.xid = buf.xid
+			m.commitLSN = buf.commitLSN
+			buf.buffer(m)
+		}
+	}
+}
+
+// messageXid returns the (sub)transaction XID a streamed message was decoded
+// with (proto v2 prefixes every message inside STREAM START/STOP with it).
+func messageXid(msg any) uint32 {
+	switch m := msg.(type) {
+	case *format.Insert:
+		return m.XID
+	case *format.Update:
+		return m.XID
+	case *format.Delete:
+		return m.XID
+	case *format.Truncate:
+		return m.XID
+	case *format.Relation:
+		return m.XID
+	case *format.LogicalDecodingMessage:
+		return m.XID
+	}
+	return 0
+}
+
+func (s *stream) process(ctx context.Context) {
+	logger.Info("postgres message process started")
+	err := s.processLoop(ctx)
+	s.processEnd <- struct{}{}
+	if err == nil || s.closed.Load() {
+		return
+	}
+
+	// Same restart path as the sink's corrupted connection: shut the stream
+	// down (flushing the confirmed LSN) and crash so the process restarts with
+	// fresh connections. The gated message was never acked, so it is redelivered.
+	logger.Error("visibility guard failed, restarting stream", "error", err)
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), streamShutdownTimeout)
+	defer cancel()
+	if cErr := s.Close(closeCtx); cErr != nil {
+		logger.Error("replication stream shutdown failed", "error", cErr)
+	}
+	panic(err)
+}
+
+// processLoop delivers messages to the listener until the context is done or
+// the message channel is closed. It returns an error only when the visibility
+// guard can no longer certify visibility (failMode: closed, or a guard error).
+//
+// Everything in messageCH is committed on the server as long as two_phase is
+// off: ReorderBufferCommit is reached only from DecodeCommit, and this library
+// never requests two_phase. The gate therefore only waits for the commit to
+// become visible, never for it to happen.
+func (s *stream) processLoop(ctx context.Context) error {
+	// The transaction gated last, as (xid, commitLSN): xid alone repeats after
+	// wraparound, the pair never does. gated is false until the first gate so
+	// that a zero pair is never mistaken for "already gated".
+	var lastGated struct {
+		commitLSN pq.LSN
+		xid       uint32
+		gated     bool
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("postgres message process stopped")
+			return nil
+		case msg, ok := <-s.messageCH:
+			if !ok {
+				logger.Info("postgres message process stopped")
+				return nil
+			}
+			if msg == nil {
+				continue
+			}
+
+			// Ack only advances the confirmed position in memory; the standby
+			// status update is flushed to Postgres by the sink loop (idle-timeout
+			// and keepalive-reply paths) and by the periodic statusUpdateLoop.
+			// Sending it per message would serialize every ack behind the
+			// connMu-held read, collapsing throughput while a buffered
+			// transaction is drained.
+			var done atomic.Bool
+			ackFunc := func() error {
+				s.UpdateConfirmedXLogPos(pq.LSN(msg.walStart))
+				// First Ack only: a repeat must not make a later message look acked.
+				if done.CompareAndSwap(false, true) {
+					s.acked.Add(1)
+				}
+				return nil
+			}
+
+			if s.isHeartbeatMessage(msg.message) {
+				if err := ackFunc(); err != nil {
+					logger.Error("heartbeat auto-ack failed", "error", err)
+				}
+				continue
+			}
+
+			// Gate once per transaction, on its first message.
+			if s.guard != nil && msg.transactionScoped() && (!lastGated.gated || msg.xid != lastGated.xid || msg.commitLSN != lastGated.commitLSN) {
+				if err := s.gate(ctx, msg.xid, msg.commitLSN); err != nil {
+					if ctx.Err() != nil {
+						// Shutting down mid-wait: never dispatch an uncertified message.
+						// It stays un-acked and is redelivered after restart.
+						logger.Info("postgres message process stopped")
+						return nil
+					}
+					return err
+				}
+				lastGated.xid, lastGated.commitLSN, lastGated.gated = msg.xid, msg.commitLSN, true
+			}
+
+			lCtx := &ListenerContext{
+				Context:   ctx,
+				Message:   msg.message,
+				Ack:       ackFunc,
+				Xid:       msg.xid,
+				CommitLSN: msg.commitLSN,
+			}
+
+			switch lCtx.Message.(type) {
+			case *format.Insert:
+				s.metric.InsertOpIncrement(1)
+			case *format.Delete:
+				s.metric.DeleteOpIncrement(1)
+			case *format.Update:
+				s.metric.UpdateOpIncrement(1)
+			case *format.LogicalDecodingMessage:
+				s.metric.LogicalMessageIncrement(1)
+			}
+
+			start := time.Now().UTC()
+			s.listenerFunc(lCtx)
+			s.metric.SetProcessLatency(time.Since(start).Nanoseconds())
+		}
+	}
+}
+
+// gate waits until xid is visible on the primary and, when replicas are
+// configured, until every listed standby has replayed commitLSN; both waits
+// share one deadline of visibilityGuard.timeout from the start of the gate.
+// A timeout is fatal under failMode closed and a logged, counted pass-through
+// under failMode open; any other guard error is fatal in both modes.
+func (s *stream) gate(ctx context.Context, xid uint32, commitLSN pq.LSN) error {
+	if xid == 0 || commitLSN == 0 {
+		// Every decoded BEGIN / STREAM COMMIT carries a valid xid and the commit
+		// record's LSN; snapshot events, the only messages without them, never
+		// pass through here (connector.snapshotHandler). A zero here means the
+		// message was decoded without its BEGIN, so nothing can be certified:
+		// fail closed instead of gating xid 0 and skipping the standbys.
+		return fmt.Errorf("%w: message without a decoded BEGIN (xid %d, commitLSN %s)", ErrVisibilityGuard, xid, commitLSN)
+	}
+	start := time.Now()
+	err := s.guard.wait(ctx, xid)
+	if err == nil && s.replicas != nil {
+		err = s.replicas.wait(ctx, xid, commitLSN, start.Add(s.config.VisibilityGuard.Timeout))
+	}
+	s.metric.ObserveVisibilityWait(time.Since(start))
+	switch {
+	case err == nil:
+		return nil
+	case goerrors.Is(err, ErrVisibilityTimeout) && s.config.VisibilityGuard.FailMode == config.VisibilityFailOpen:
+		logger.Warn("visibility guard timeout, dispatching anyway (failMode: open)", "xid", xid, "error", err)
+		s.metric.VisibilityFailOpenIncrement()
+		return nil
+	default:
+		return fmt.Errorf("%w: %w", ErrVisibilityGuard, err)
+	}
+}
+
+func (s *stream) isHeartbeatMessage(msg any) bool {
+	if !s.config.IsHeartbeatEnabled() {
+		return false
+	}
+
+	hbSchema := s.config.Heartbeat.Table.Schema
+	hbTable := s.config.Heartbeat.Table.Name
+
+	switch m := msg.(type) {
+	case *format.Insert:
+		return m.TableNamespace == hbSchema && m.TableName == hbTable
+	case *format.Update:
+		return m.TableNamespace == hbSchema && m.TableName == hbTable
+	case *format.Delete:
+		return m.TableNamespace == hbSchema && m.TableName == hbTable
+	}
+
+	return false
+}
+
+func (s *stream) Close(ctx context.Context) error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, streamShutdownTimeout)
+		defer cancel()
+	}
+	var errs []error
+
+	// Cancel first so a process goroutine blocked in the visibility guard (or a
+	// context-aware listener) returns instead of waiting out its timeout.
+	if s.cancel != nil {
+		s.cancel()
+	}
+
+	// Close the PostgreSQL socket before waiting on the goroutines. A listener
+	// callback is synchronous and may be blocked outside this package; waiting
+	// for it before closing the socket can leave the walsender connection open
+	// for the whole shutdown timeout. Every writer bounds its write with
+	// standbyStatusWriteTimeout, so this lock cannot outlive the shutdown budget.
+	s.connMu.Lock()
+	if !s.conn.IsClosed() {
+		s.flushFinalStandbyStatusUpdateLocked(ctx)
+		if err := s.conn.Close(ctx); err != nil {
+			errs = append(errs, err)
+		}
+		logger.Info("postgres connection closed")
+	}
+	s.connMu.Unlock()
+
+	if s.sinkStarted.Load() {
+		select {
+		case <-s.sinkEnd:
+			logger.Info("postgres message sink stopped")
+		case <-ctx.Done():
+			logger.Warn("timed out waiting for postgres message sink", "error", ctx.Err())
+			errs = append(errs, errors.Wrap(ctx.Err(), "wait for postgres message sink"))
+		}
+	}
+
+	if s.processStarted.Load() {
+		select {
+		case <-s.processEnd:
+			logger.Info("postgres message process stopped")
+		case <-ctx.Done():
+			logger.Warn("timed out waiting for postgres message process", "error", ctx.Err())
+			errs = append(errs, errors.Wrap(ctx.Err(), "wait for postgres message process"))
+		}
+	}
+
+	if s.statusUpdateStarted.Load() {
+		select {
+		case <-s.statusUpdateEnd:
+			logger.Info("postgres standby status update loop stopped")
+		case <-ctx.Done():
+			logger.Warn("timed out waiting for standby status update loop", "error", ctx.Err())
+			errs = append(errs, errors.Wrap(ctx.Err(), "wait for standby status update loop"))
+		}
+	}
+
+	// Only the process goroutine uses the guard connection; close it after that
+	// goroutine has stopped so the close never races an in-flight poll.
+	if s.guard != nil {
+		if err := s.guard.close(ctx); err != nil {
+			errs = append(errs, errors.Wrap(err, "close visibility guard"))
+		}
+		logger.Info("visibility guard connection closed")
+	}
+	if s.replicas != nil {
+		if err := s.replicas.close(ctx); err != nil {
+			errs = append(errs, errors.Wrap(err, "close replica guard"))
+		}
+		logger.Info("replica guard connections closed")
+	}
+
+	return goerrors.Join(errs...)
+}
+
+func isReplicationConnectionTerminationError(err error) bool {
+	if goerrors.Is(err, io.EOF) ||
+		goerrors.Is(err, io.ErrUnexpectedEOF) ||
+		goerrors.Is(err, net.ErrClosed) ||
+		goerrors.Is(err, syscall.ECONNRESET) ||
+		goerrors.Is(err, syscall.EPIPE) {
+		return true
+	}
+
+	return false
+}
+
+func isPostgresShutdownError(err error) bool {
+	var pgErr *pgconn.PgError
+	if goerrors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case postgresAdminShutdown, postgresCrashShutdown:
+			return true
+		default:
+			return false
+		}
+	}
+
+	return false
+}
+
+func handleReplicationConnectionTermination(err error) bool {
+	if isPostgresShutdownError(err) {
+		logger.Info("postgres replication connection closed", "error", err)
+		return true
+	}
+	if isReplicationConnectionTerminationError(err) {
+		if goerrors.Is(err, io.ErrUnexpectedEOF) {
+			logger.Error("postgres replication connection terminated unexpectedly", "error", err)
+		} else {
+			logger.Info("postgres replication connection closed", "error", err)
+		}
+		return true
+	}
+	return false
+}
+
+func (s *stream) GetSystemInfo() *pq.IdentifySystemResult {
+	return s.system
+}
+
+func (s *stream) GetMetric() metric.Metric {
+	return s.metric
+}
+
+func (s *stream) SetSnapshotLSN(lsn pq.LSN) {
+	s.snapshotLSN = lsn
+}
+
+func (s *stream) UpdateXLogPos(l pq.LSN) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.lastXLogPos < l {
+		s.lastXLogPos = l
+	}
+}
+
+func (s *stream) LoadXLogPos() pq.LSN {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastXLogPos
+}
+
+func (s *stream) UpdateConfirmedXLogPos(l pq.LSN) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.confirmedXLogPos < l {
+		s.confirmedXLogPos = l
+	}
+}
+
+func (s *stream) LoadConfirmedXLogPos() pq.LSN {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.confirmedXLogPos
+}
+
+func (s *stream) OpenFromSnapshotLSN() {
+	s.openFromSnapshotLSN = true
+}
+
+// fetchSnapshotLSN queries the database to get the snapshot LSN from cdc_snapshot_job table
+// Uses infinite retry with exponential backoff for resilience against transient database errors
+func (s *stream) fetchSnapshotLSN(ctx context.Context) (pq.LSN, error) {
+	logger.Info("fetching snapshot LSN from database", "slotName", s.config.Slot.Name)
+
+	var snapshotLSN pq.LSN
+
+	err := retry.Do(
+		func() error {
+			// Create a separate connection for querying metadata
+			// Use regular DSN (not replication DSN) for normal SQL queries
+			conn, err := pq.NewConnection(ctx, s.config.DSN())
+			if err != nil {
+				return errors.Wrap(err, "create connection for snapshot LSN query")
+			}
+			defer conn.Close(ctx)
+
+			query := fmt.Sprintf(`
+				SELECT snapshot_lsn, completed
+				FROM cdc_snapshot_job
+				WHERE slot_name = '%s'
+			`, s.config.Slot.Name)
+
+			resultReader := conn.Exec(ctx, query)
+			results, err := resultReader.ReadAll()
+			if err != nil {
+				resultReader.Close()
+				return errors.Wrap(err, "execute snapshot LSN query")
+			}
+
+			if err = resultReader.Close(); err != nil {
+				return errors.Wrap(err, "close result reader")
+			}
+
+			if len(results) == 0 || len(results[0].Rows) == 0 {
+				return retry.Unrecoverable(errors.New("no snapshot job found for slot: " + s.config.Slot.Name))
+			}
+
+			row := results[0].Rows[0]
+
+			completed := string(row[1]) == "true" || string(row[1]) == "t"
+			if !completed {
+				return errors.New("snapshot job not completed yet for slot: " + s.config.Slot.Name)
+			}
+
+			lsnStr := string(row[0])
+			if lsnStr == "" {
+				return retry.Unrecoverable(errors.New("empty snapshot LSN result"))
+			}
+
+			snapshotLSN, err = pq.ParseLSN(lsnStr)
+			if err != nil {
+				return retry.Unrecoverable(errors.Wrap(err, "parse snapshot LSN: "+lsnStr))
+			}
+
+			return nil
+		},
+		retry.Attempts(0),                   // 0 means infinite retries
+		retry.DelayType(retry.BackOffDelay), // Exponential backoff
+		retry.OnRetry(func(n uint, err error) {
+			logger.Error("error in snapshot LSN fetch, retrying",
+				"attempt", n+1,
+				"error", err,
+				"slotName", s.config.Slot.Name)
+		}),
+	)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to fetch snapshot LSN")
+	}
+
+	logger.Info("fetched snapshot LSN from database", "slotName", s.config.Slot.Name, "snapshotLSN", snapshotLSN.String())
+	return snapshotLSN, nil
+}
+
+// writeDeadliner is implemented by pq.connection, which exposes its socket.
+// Fakes used in tests may omit it; the write then stays unbounded.
+type writeDeadliner interface {
+	SetWriteDeadline(t time.Time) error
+}
+
+// sendStandbyStatusUpdate writes a standby status update under connMu so it can
+// never overlap the sink loop's ReceiveMessage, which toggles the connection's
+// socket deadline. Every status-update write — idle keepalive, reply-on-request,
+// periodic timer, and final shutdown update — must go through here rather than
+// calling SendStandbyStatusUpdate directly. See the connMu field comment.
+func (s *stream) sendStandbyStatusUpdate(ctx context.Context) error {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return s.writeStandbyStatusUpdate(ctx)
+}
+
+// sendRunStandbyStatusUpdate acknowledges on behalf of the stream's run
+// context. That context's deadline bounds the stream's lifetime, not a single
+// 34-byte write: applying it here would turn an expiring run context into an
+// i/o timeout that the sink reports as a corrupted connection. Only the
+// shutdown update, which runs under Close's context, is bounded by the caller.
+func (s *stream) sendRunStandbyStatusUpdate(ctx context.Context) error {
+	return s.sendStandbyStatusUpdate(context.WithoutCancel(ctx))
+}
+
+// writeStandbyStatusUpdate performs the write with a bounded socket deadline.
+// The caller must hold connMu.
+func (s *stream) writeStandbyStatusUpdate(ctx context.Context) error {
+	if d, ok := s.conn.(writeDeadliner); ok {
+		deadline := time.Now().Add(standbyStatusWriteTimeout)
+		if ctxDeadline, hasDeadline := ctx.Deadline(); hasDeadline && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		if err := d.SetWriteDeadline(deadline); err != nil {
+			return errors.Wrap(err, "set standby status write deadline")
+		}
+		defer func() {
+			_ = d.SetWriteDeadline(time.Time{})
+		}()
+	}
+	return SendStandbyStatusUpdate(ctx, s.conn, uint64(s.LoadXLogPos()), uint64(s.LoadConfirmedXLogPos()))
+}
+
+// startStatusUpdateLoop runs the periodic acknowledger and closes
+// statusUpdateEnd when it returns, so Close can join it.
+func (s *stream) startStatusUpdateLoop(ctx context.Context) {
+	s.statusUpdateStarted.Store(true)
+	go func() {
+		defer close(s.statusUpdateEnd)
+		s.statusUpdateLoop(ctx)
+	}()
+}
+
+// statusUpdateLoop acknowledges the primary on a fixed cadence without waiting
+// for a read. The sink-loop reply paths only run when the sink reaches the
+// socket, and a reply-requested keepalive sits behind the WAL already sent, so
+// a backlog that keeps the socket from draining can miss wal_sender_timeout
+// (the request arrives around wal_sender_timeout/2). A write failure cancels
+// the stream: a timed-out or partial write leaves the protocol position
+// unusable, and the sink turns statusUpdateFailed into a restart.
+func (s *stream) statusUpdateLoop(ctx context.Context) {
+	interval := s.config.StatusUpdateEvery()
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Nothing received yet: the update would carry a zero position.
+			if s.closed.Load() || s.LoadXLogPos() == 0 {
+				continue
+			}
+			if err := s.sendRunStandbyStatusUpdate(ctx); err != nil {
+				if s.closed.Load() || ctx.Err() != nil {
+					return
+				}
+				logger.Error("periodic standby status update failed, restarting the stream", "error", err)
+				s.statusUpdateFailed.Store(true)
+				if s.cancel != nil {
+					s.cancel()
+				}
+				return
+			}
+			logger.Debug("periodic standby status update sent")
+		}
+	}
+}
+
+// flushFinalStandbyStatusUpdateLocked sends the final confirmed position.
+// The caller must hold connMu.
+func (s *stream) flushFinalStandbyStatusUpdateLocked(ctx context.Context) {
+	if s.LoadConfirmedXLogPos() == 0 {
+		return
+	}
+	if err := s.writeStandbyStatusUpdate(ctx); err != nil {
+		logger.Warn("final standby status update failed, updates may duplicate on restart", "error", err)
+		return
+	}
+	logger.Debug("final standby status update sent")
+}
+
+func SendStandbyStatusUpdate(_ context.Context, conn pq.Connection, walReceivedPosition, walFlushedPosition uint64) error {
+	data := make([]byte, 0, 34)
+	data = append(data, StandbyStatusUpdateByteID)
+	data = AppendUint64(data, walReceivedPosition)
+	data = AppendUint64(data, walFlushedPosition)
+	data = AppendUint64(data, walFlushedPosition)
+	data = AppendUint64(data, timeToPgTime(time.Now()))
+	data = append(data, 0)
+
+	cd := &pgproto3.CopyData{Data: data}
+	buf, err := cd.Encode(nil)
+	if err != nil {
+		return err
+	}
+
+	return conn.Frontend().SendUnbufferedEncodedCopyData(buf)
+}
+
+func AppendUint64(buf []byte, n uint64) []byte {
+	wp := len(buf)
+	buf = append(buf, 0, 0, 0, 0, 0, 0, 0, 0)
+	binary.BigEndian.PutUint64(buf[wp:], n)
+	return buf
+}
+
+func timeToPgTime(t time.Time) uint64 {
+	return uint64(t.UTC().UnixMicro() - microSecFromUnixEpochToY2K)
+}

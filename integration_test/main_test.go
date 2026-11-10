@@ -1,0 +1,318 @@
+package integration
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Trendyol/go-pq-cdc/config"
+	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/go-playground/errors"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/network"
+	"github.com/testcontainers/testcontainers-go/wait"
+)
+
+var (
+	Config    config.Config
+	Container testcontainers.Container
+	// Network joins the primary (alias "primary") and the standbys some tests start.
+	Network *testcontainers.DockerNetwork
+)
+
+var (
+	PostgresVersion = "POSTGRES_VERSION"
+	defaultVersion  = "16-alpine"
+)
+
+func TestMain(m *testing.M) {
+	var err error
+	Config, err = config.ReadConfigYAML("./test_connector.yaml")
+	if err != nil {
+		log.Fatal(err)
+	}
+	Config.SetDefault()
+
+	ctx := context.Background()
+	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true") // Podman: disable Ryuk
+	Network, err = network.New(ctx)
+	if err != nil {
+		log.Fatal("create test network", err)
+	}
+	defer func() {
+		if err = Network.Remove(ctx); err != nil {
+			log.Fatal("remove test network", err)
+		}
+	}()
+	Container, err = SetupTestContainer(ctx, Config)
+	if err != nil {
+		log.Fatal("setup test container", err)
+	}
+	defer func() {
+		err = Container.Terminate(ctx)
+		if err != nil {
+			log.Fatal("terminate test container", err)
+		}
+	}()
+
+	mappedPort, err := Container.MappedPort(ctx, "5432/tcp")
+	if err != nil {
+		log.Fatal("get mapped port", err)
+	}
+	Config.Host = "localhost"
+	Config.Port = mappedPort.Int()
+
+	conn, err := newPostgresConn()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		err = conn.Close(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	err = createCDCUser(ctx, conn, Config)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err = allowReplicationConnections(ctx, conn); err != nil {
+		log.Fatal(err)
+	}
+
+	m.Run()
+}
+
+func SetupTestContainer(ctx context.Context, cfg config.Config) (testcontainers.Container, error) {
+	req, err := containerRequest(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return testcontainers.GenericContainer(ctx, req)
+}
+
+func containerRequest(cfg config.Config) (testcontainers.GenericContainerRequest, error) {
+	version := os.Getenv(PostgresVersion)
+	if version == "" {
+		version = defaultVersion
+	}
+
+	req := testcontainers.ContainerRequest{
+		Image: "docker.io/postgres:" + version,
+		Env: map[string]string{
+			"POSTGRES_USER":     "postgres",
+			"POSTGRES_PASSWORD": "postgres",
+			"POSTGRES_DB":       cfg.Database,
+		},
+		ExposedPorts:   []string{"5432/tcp"},
+		Cmd:            []string{"postgres", "-c", "fsync=off", "-c", "wal_level=logical", "-c", "max_wal_senders=100", "-c", "max_replication_slots=50"},
+		Networks:       []string{Network.Name},
+		NetworkAliases: map[string][]string{Network.Name: {"primary"}},
+	}
+
+	genericContainerReq := testcontainers.GenericContainerRequest{
+		ContainerRequest: req,
+		Started:          true,
+	}
+
+	err := testcontainers.WithWaitStrategy(
+		wait.ForExec([]string{"pg_isready", "-U", "postgres", "-d", cfg.Database}).
+			WithStartupTimeout(30 * time.Second)).Customize(&genericContainerReq)
+	if err != nil {
+		return testcontainers.GenericContainerRequest{}, err
+	}
+
+	return genericContainerReq, nil
+}
+
+func newPostgresConn() (pq.Connection, error) {
+	c := config.Config{
+		Host:     Config.Host,
+		Port:     Config.Port,
+		Username: "postgres",
+		Password: "postgres",
+		Database: Config.Database,
+	}
+
+	return pq.NewConnection(context.TODO(), c.DSN())
+}
+
+func SetupTestDB(ctx context.Context, conn pq.Connection, cfg config.Config) error {
+	if err := createBooksTable(ctx, conn); err != nil {
+		return err
+	}
+
+	if err := dropPublication(ctx, conn, cfg); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func RestoreDB(ctx context.Context) error {
+	conn, err := newPostgresConn()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = conn.Close(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	if err = createBooksTable(ctx, conn); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func createCDCUser(ctx context.Context, conn pq.Connection, cfg config.Config) error {
+	commands := []string{
+		fmt.Sprintf("CREATE USER %s WITH SUPERUSER REPLICATION PASSWORD '%s';", cfg.Username, cfg.Password),
+		fmt.Sprintf("GRANT CONNECT, CREATE ON DATABASE %s TO %s;", cfg.Database, cfg.Username),
+		fmt.Sprintf("GRANT USAGE ON SCHEMA public TO %s;", cfg.Username),
+	}
+
+	for _, command := range commands {
+		err := pgExec(ctx, conn, command)
+		if err != nil {
+			return errors.Wrap(err, "create cdc user")
+		}
+	}
+
+	return nil
+}
+
+// allowReplicationConnections lets standbys started by tests stream from the
+// primary: the image's default pg_hba.conf only opens "all" databases, and the
+// replication pseudo-database needs its own line.
+func allowReplicationConnections(ctx context.Context, conn pq.Connection) error {
+	code, out, err := Container.Exec(ctx, []string{"sh", "-c", `echo "host replication all all scram-sha-256" >> "$PGDATA/pg_hba.conf"`})
+	if err != nil {
+		return errors.Wrap(err, "append pg_hba replication line")
+	}
+	if code != 0 {
+		b, _ := io.ReadAll(out)
+		return errors.Newf("append pg_hba replication line: exit %d: %s", code, b)
+	}
+	return pgExec(ctx, conn, "SELECT pg_reload_conf()")
+}
+
+func createBooksTable(ctx context.Context, conn pq.Connection) error {
+	query := `
+		DROP TABLE IF EXISTS books;
+		CREATE TABLE books (
+			id SERIAL PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+	`
+	err := pgExec(ctx, conn, query)
+	if err != nil {
+		return errors.Wrap(err, "create books table")
+	}
+
+	return nil
+}
+
+func dropPublication(ctx context.Context, conn pq.Connection, cfg config.Config) error {
+	err := pgExec(ctx, conn, "DROP PUBLICATION IF EXISTS "+cfg.Publication.Name)
+	if err != nil {
+		return errors.Wrap(err, "drop publication")
+	}
+
+	return nil
+}
+
+func pgExec(ctx context.Context, conn pq.Connection, command string) error {
+	resultReader := conn.Exec(ctx, command)
+	_, err := resultReader.ReadAll()
+	if err != nil {
+		return err
+	}
+
+	if err = resultReader.Close(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// protoVersions lists the pgoutput protocol versions that every CDC
+// integration test should exercise.
+var protoVersions = []int{1, 2}
+
+// forEachProtoVersion runs fn as a subtest for every protocol version.
+// It copies cdcCfg, sets ProtoVersion, and appends "_v{N}" to the slot name
+// so that parallel subtests don't collide.
+func forEachProtoVersion(t *testing.T, cdcCfg config.Config, fn func(t *testing.T, cfg config.Config)) {
+	t.Helper()
+	for _, v := range protoVersions {
+		cfg := cdcCfg
+		cfg.Slot.ProtoVersion = v
+		cfg.Slot.Name = fmt.Sprintf("%s_v%d", cdcCfg.Slot.Name, v)
+		t.Run(fmt.Sprintf("proto_v%d", v), func(t *testing.T) {
+			fn(t, cfg)
+		})
+	}
+}
+
+func fetchDeleteOpMetric() (int, error) {
+	m, err := fetchMetrics("go_pq_cdc_delete_total")
+	mi, _ := strconv.Atoi(m)
+	return mi, err
+}
+
+func fetchInsertOpMetric() (int, error) {
+	m, err := fetchMetrics("go_pq_cdc_insert_total")
+	mi, _ := strconv.Atoi(m)
+	return mi, err
+}
+
+func fetchUpdateOpMetric() (int, error) {
+	m, err := fetchMetrics("go_pq_cdc_update_total")
+	mi, _ := strconv.Atoi(m)
+	return mi, err
+}
+
+func fetchMetrics(metricName string) (string, error) {
+	resp, err := http.Get("http://localhost:8083/metrics")
+	if err != nil {
+		return "", errors.Wrap(err, "error fetching metrics")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", errors.Newf("error: received status code %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", errors.Wrap(err, "error reading response body")
+	}
+
+	bodyStr := string(body)
+	lines := strings.Split(bodyStr, "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, metricName) {
+			parts := strings.Fields(line)
+			if len(parts) == 2 {
+				return parts[1], nil
+			}
+		}
+	}
+	return "", errors.Newf("metric %s not found in response", metricName)
+}
